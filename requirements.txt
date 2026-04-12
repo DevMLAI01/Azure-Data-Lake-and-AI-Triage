@@ -1,0 +1,31 @@
+# Install with: uv pip install -r requirements.txt
+# Never use bare pip in this project — always use uv pip or uv run
+#
+# To set up from scratch:
+#   pip install uv          # one-time bootstrap
+#   uv venv                 # creates .venv/
+#   uv pip install -r requirements.txt
+
+# Azure SDKs
+azure-core==1.39.0
+azure-identity==1.25.3
+azure-keyvault-secrets==4.10.0
+azure-mgmt-core==1.6.0
+azure-mgmt-resource==25.0.0
+azure-mgmt-storage==24.0.1
+azure-storage-blob==12.28.0
+azure-storage-file-datalake==12.23.0
+
+# Data
+pandas==3.0.2
+pyarrow==23.0.1
+numpy==2.4.4
+
+# AI / Agent
+openai==2.31.0
+databricks-sdk==0.102.0
+
+# Utilities
+python-dotenv==1.2.2
+requests==2.33.1
+tqdm==4.67.3

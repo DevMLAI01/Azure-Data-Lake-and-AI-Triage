@@ -1,0 +1,14 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.db
+*.log
+powerbi/*.pbix
+azure_function/.python_packages/
+azure_function/local.settings.json

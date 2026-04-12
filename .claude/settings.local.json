@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3 -c \"import azure.storage.filedatalake\")",
+      "Bash(py -3 -c \"import databricks\")",
+      "Bash(py -3 -c \"import openai\")",
+      "Bash(uv venv:*)",
+      "Bash(uv pip:*)",
+      "Bash(az ad:*)",
+      "Bash(az keyvault:*)",
+      "Bash(az role:*)",
+      "Bash(.venv/Scripts/python.exe scripts/run_notebook.py --all-bronze)",
+      "Bash(.venv/Scripts/python -c ':*)",
+      "Bash(.venv/Scripts/python scripts/create_sql_alert.py --preview)",
+      "Bash(az account:*)",
+      "Bash(az cognitiveservices:*)",
+      "Bash(python -c ':*)",
+      "Bash(az provider:*)",
+      "Bash(az functionapp:*)"
+    ]
+  }
+}
