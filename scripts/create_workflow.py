@@ -8,8 +8,9 @@ The DAG has three stages with proper task dependencies:
   Stage 2 — Silver  (2 tasks, each depends on all 6 bronze tasks)
   Stage 3 — Gold    (3 tasks, each depends on all 2 silver tasks)
 
-All tasks run on the existing cluster.  The job is scheduled daily at
-06:00 UTC but can also be triggered manually.
+Each task spins up its own ephemeral job cluster (spot + on-demand fallback)
+that terminates automatically on completion — no always-on cluster needed.
+The job is scheduled daily at 06:00 UTC but starts PAUSED; trigger manually.
 
 Usage:
     uv run scripts/create_workflow.py           # create/update workflow
@@ -22,15 +23,15 @@ import time
 import argparse
 from dotenv import load_dotenv
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service import jobs
+from databricks.sdk.service import compute, jobs  # noqa: F401
 
 load_dotenv()
 
-HOST  = os.environ["DATABRICKS_HOST"]
+HOST = os.environ["DATABRICKS_HOST"]
 TOKEN = os.environ["DATABRICKS_TOKEN"]
 
-WORKFLOW_NAME  = "daily_medallion_pipeline"
-DATABRICKS_DIR = "/telecom-triage"   # where notebooks were uploaded by run_notebook.py
+WORKFLOW_NAME = "daily_medallion_pipeline"
+DATABRICKS_DIR = "/telecom-triage"  # where notebooks were uploaded by run_notebook.py
 
 # All notebook paths on the Databricks workspace (without .py extension)
 BRONZE_NOTEBOOKS = [
@@ -56,17 +57,31 @@ def get_client() -> WorkspaceClient:
     return WorkspaceClient(host=HOST, token=TOKEN)
 
 
-def get_cluster_id(w: WorkspaceClient) -> str:
-    clusters = list(w.clusters.list())
-    if not clusters:
-        raise RuntimeError("No clusters found. Create a cluster in Databricks first.")
-    for c in clusters:
-        if "RUNNING" in str(c.state).upper():
-            print(f"  Using running cluster: {c.cluster_name} ({c.cluster_id})")
-            return c.cluster_id
-    c = clusters[0]
-    print(f"  Using cluster (will start): {c.cluster_name} ({c.cluster_id})")
-    return c.cluster_id
+def get_spark_version(w: WorkspaceClient) -> str:
+    """Return the latest LTS Spark runtime available in the workspace."""
+    versions = w.clusters.spark_versions().versions or []
+    lts = [
+        v
+        for v in versions
+        if v.key and "lts" in v.key.lower() and "scala2.12" in v.key.lower()
+    ]
+    if lts:
+        return lts[0].key
+    return "15.4.x-scala2.12"  # safe fallback
+
+
+def make_job_cluster_spec(spark_version: str) -> compute.ClusterSpec:
+    """Ephemeral spot cluster — spins up for the task and terminates on completion."""
+    return compute.ClusterSpec(
+        spark_version=spark_version,
+        node_type_id="Standard_DS3_v2",  # 14 GB RAM, 4 vCPUs — right-sized for this data volume
+        num_workers=1,
+        azure_attributes=compute.AzureAttributes(
+            availability=compute.AzureAvailability.SPOT_WITH_FALLBACK_AZURE,
+            spot_bid_max_price=-1,  # cap at on-demand price
+            first_on_demand=1,  # driver node always on-demand for stability
+        ),
+    )
 
 
 def notebook_path(name: str) -> str:
@@ -76,7 +91,7 @@ def notebook_path(name: str) -> str:
 def make_task(
     task_key: str,
     notebook_name: str,
-    cluster_id: str,
+    spark_version: str,
     depends_on: list[str] | None = None,
 ) -> jobs.Task:
     deps = [jobs.TaskDependency(task_key=k) for k in (depends_on or [])]
@@ -85,7 +100,7 @@ def make_task(
         notebook_task=jobs.NotebookTask(
             notebook_path=notebook_path(notebook_name),
         ),
-        existing_cluster_id=cluster_id,
+        new_cluster=make_job_cluster_spec(spark_version),  # ephemeral spot cluster
         depends_on=deps if deps else None,
     )
 
@@ -97,26 +112,34 @@ def delete_existing(w: WorkspaceClient) -> None:
         w.jobs.delete(job_id=job.job_id)
 
 
-def create_workflow(w: WorkspaceClient, cluster_id: str) -> int:
+def create_workflow(w: WorkspaceClient, spark_version: str) -> int:
     # --- Stage 1: Bronze (all parallel, no dependencies) ---
     bronze_tasks = [
-        make_task(f"bronze_{nb.replace('01_bronze_', '')}", nb, cluster_id)
+        make_task(f"bronze_{nb.replace('01_bronze_', '')}", nb, spark_version)
         for nb in BRONZE_NOTEBOOKS
     ]
     bronze_keys = [t.task_key for t in bronze_tasks]
 
     # --- Stage 2: Silver (each depends on ALL bronze tasks) ---
     silver_tasks = [
-        make_task(f"silver_{nb.replace('02_silver_', '')}", nb, cluster_id,
-                  depends_on=bronze_keys)
+        make_task(
+            f"silver_{nb.replace('02_silver_', '')}",
+            nb,
+            spark_version,
+            depends_on=bronze_keys,
+        )
         for nb in SILVER_NOTEBOOKS
     ]
     silver_keys = [t.task_key for t in silver_tasks]
 
     # --- Stage 3: Gold (each depends on ALL silver tasks) ---
     gold_tasks = [
-        make_task(f"gold_{nb.replace('03_gold_', '')}", nb, cluster_id,
-                  depends_on=silver_keys)
+        make_task(
+            f"gold_{nb.replace('03_gold_', '')}",
+            nb,
+            spark_version,
+            depends_on=silver_keys,
+        )
         for nb in GOLD_NOTEBOOKS
     ]
 
@@ -126,9 +149,9 @@ def create_workflow(w: WorkspaceClient, cluster_id: str) -> int:
         name=WORKFLOW_NAME,
         tasks=all_tasks,
         schedule=jobs.CronSchedule(
-            quartz_cron_expression="0 0 6 * * ?",   # 06:00 UTC daily
+            quartz_cron_expression="0 0 6 * * ?",  # 06:00 UTC daily
             timezone_id="UTC",
-            pause_status=jobs.PauseStatus.PAUSED,    # start paused; unpause when ready
+            pause_status=jobs.PauseStatus.PAUSED,  # start paused; unpause when ready
         ),
         max_concurrent_runs=1,
     )
@@ -142,8 +165,12 @@ def create_workflow(w: WorkspaceClient, cluster_id: str) -> int:
     print(f"\n  Tasks ({len(all_tasks)}):")
     print(f"    Bronze  ({len(bronze_tasks)} parallel) : {', '.join(bronze_keys)}")
     print(f"    Silver  ({len(silver_tasks)}, after bronze): {', '.join(silver_keys)}")
-    print(f"    Gold    ({len(gold_tasks)}, after silver): {', '.join([t.task_key for t in gold_tasks])}")
-    print(f"\n  Schedule: 06:00 UTC daily (currently PAUSED — unpause in Databricks UI when ready)")
+    print(
+        f"    Gold    ({len(gold_tasks)}, after silver): {', '.join([t.task_key for t in gold_tasks])}"
+    )
+    print(
+        "\n  Schedule: 06:00 UTC daily (currently PAUSED — unpause in Databricks UI when ready)"
+    )
     return job_id
 
 
@@ -170,12 +197,12 @@ def trigger_run(w: WorkspaceClient, job_id: int) -> None:
         if any(s in state_str for s in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")):
             result = str(run_info.state.result_state)
             if "SUCCESS" in result:
-                print(f"\n  Run SUCCEEDED.")
+                print("\n  Run SUCCEEDED.")
             else:
                 msg = run_info.state.state_message or ""
                 print(f"\n  Run FAILED — {msg}")
                 # Print failed task details
-                for task in (run_info.tasks or []):
+                for task in run_info.tasks or []:
                     task_state = str(task.state.result_state) if task.state else ""
                     if "FAILED" in task_state or "TIMEDOUT" in task_state:
                         print(f"    Failed task: {task.task_key}")
@@ -197,19 +224,25 @@ def trigger_run(w: WorkspaceClient, job_id: int) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create the daily_medallion_pipeline Databricks Workflow")
-    parser.add_argument("--run", action="store_true",
-                        help="Trigger a manual run immediately after creating the workflow")
+    parser = argparse.ArgumentParser(
+        description="Create the daily_medallion_pipeline Databricks Workflow"
+    )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Trigger a manual run immediately after creating the workflow",
+    )
     args = parser.parse_args()
 
-    w          = get_client()
-    cluster_id = get_cluster_id(w)
+    w = get_client()
+    spark_version = get_spark_version(w)
+    print(f"  Spark runtime: {spark_version}")
 
     print("\nRemoving any existing workflow with the same name...")
     delete_existing(w)
 
-    print("\nCreating workflow...")
-    job_id = create_workflow(w, cluster_id)
+    print("\nCreating workflow (job clusters — spot + on-demand fallback)...")
+    job_id = create_workflow(w, spark_version)
 
     if args.run:
         trigger_run(w, job_id)
